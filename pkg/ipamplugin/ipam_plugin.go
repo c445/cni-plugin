@@ -78,12 +78,12 @@ func Main(version string) {
 		// calicoClient makes IPAM calls.
 		cfg, err := apiconfig.LoadClientConfig("")
 		if err != nil {
-			logCtxt.Fatal("failed to load api client config")
+			logCtxt.Fatal("failed to load api client config: %v")
 		}
 		cfg.Spec.DatastoreType = apiconfig.Kubernetes
 		calicoClient, err := client.New(*cfg)
 		if err != nil {
-			logCtxt.Fatal("failed to initialize api client")
+			logCtxt.Fatalf("failed to initialize api client: %v", err)
 		}
 
 		// Perform the migration.

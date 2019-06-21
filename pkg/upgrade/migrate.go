@@ -34,7 +34,6 @@ import (
 	client "github.com/projectcalico/libcalico-go/lib/clientv3"
 	"github.com/projectcalico/libcalico-go/lib/errors"
 	"github.com/projectcalico/libcalico-go/lib/ipam"
-	"github.com/projectcalico/libcalico-go/lib/net"
 	cnet "github.com/projectcalico/libcalico-go/lib/net"
 	"github.com/projectcalico/libcalico-go/lib/options"
 	corev1 "k8s.io/api/core/v1"
@@ -67,68 +66,6 @@ func Migrate(ctxt context.Context, c client.Interface, nodename string) error {
 		return nil
 	}
 
-	// Get node resource to check for IPIP tunnel address.
-	log.Info("retrieving node for IPIP tunnel address")
-	node, err := c.Nodes().Get(ctxt, nodename, options.GetOptions{})
-	if err != nil {
-		return fmt.Errorf("failed to get calico node resource: %s", err)
-	}
-
-	// Migrate IPIP tunnel address if the field is empty.
-	if node.Spec.BGP == nil || node.Spec.BGP.IPv4IPIPTunnelAddr == "" {
-		log.Info("IPIP tunnel address not found, assigning...")
-
-		// Fetch k8s node.
-		k8sNode, err := k8sClient.CoreV1().Nodes().Get(nodename, metav1.GetOptions{})
-		if err != nil {
-			return fmt.Errorf("failed to get k8s node resource: %s", err)
-		}
-
-		// Parse PodCIDR.
-		ip, cidr, err := net.ParseCIDR(k8sNode.Spec.PodCIDR)
-		if err != nil {
-			return fmt.Errorf("PodCIDR %s did not parse successfully: %s", k8sNode.Spec.PodCIDR, err)
-		} else if cidr.Version() == 4 {
-			// We need to get the IP for the podCIDR and increment it to the
-			// first IP in the CIDR to match the behavior used by Calico when using host-local IPAM.
-			tunIp := ip.To4()
-			if tunIp == nil {
-				return fmt.Errorf("Cannot pick an IPv4 tunnel address from the given CIDR: %s", k8sNode.Spec.PodCIDR)
-			}
-			tunIp[3]++
-			if node.Spec.BGP == nil {
-				node.Spec.BGP = &v3.NodeBGPSpec{}
-			}
-			node.Spec.BGP.IPv4IPIPTunnelAddr = tunIp.String()
-
-			// Assign the address via Calico IPAM.
-			ipipTunnelAddr := cnet.ParseIP(node.Spec.BGP.IPv4IPIPTunnelAddr)
-			handle := fmt.Sprintf("ipip-tunnel-addr-%s", nodename)
-			if err = c.IPAM().AssignIP(ctxt, ipam.AssignIPArgs{
-				IP:       *ipipTunnelAddr,
-				Hostname: nodename,
-				HandleID: &handle,
-				Attrs: map[string]string{
-					ipam.AttributeNode: nodename,
-					ipam.AttributeType: ipam.AttributeTypeIPIP,
-				},
-			}); err != nil {
-				if _, ok := err.(errors.ErrorResourceAlreadyExists); !ok {
-					return fmt.Errorf("failed to get add IPIP tunnel addr %s: %s", node.Spec.BGP.IPv4IPIPTunnelAddr, err)
-				}
-				log.Info("IPIP tunnel address already assigned in IPAM, continuing...")
-			}
-
-			// Save the calico node object to the datastore.
-			if node, err = c.Nodes().Update(ctxt, node, options.SetOptions{}); err != nil {
-				return fmt.Errorf("failed to save newly updated node object: %s", err)
-			}
-
-			log.WithField("ip", node.Spec.BGP.IPv4IPIPTunnelAddr).Info("Assigned IPIP tunnel address to node")
-		} else if cidr.Version() == 6 {
-			log.Info("IPv6 podCIDR - no need to migrate IPIP address")
-		}
-	}
 
 	// Open k8s-pod-directory to check for emptiness.
 	log.Info("checking if host-local IPAM data dir dir is empty...")
@@ -336,11 +273,27 @@ func Migrate(ctxt context.Context, c client.Interface, nodename string) error {
 	// calicoDS, err := k8sClient.AppsV1().DaemonSets("kube-system").Get("calico-node", metav1.GetOptions{})
 	// if (calicoDS.Status.UpdatedNumberScheduled == calicoDS.Status.DesiredNumberScheduled-calicoDS.Spec.UpdateStrategy.RollingUpdate.MaxUnavailable.IntVal)
 	log.Info("setting Calico datastore readiness to true...")
-	t := true
-	clusterInfo.Spec.DatastoreReady = &t
-	if _, err = c.ClusterInformation().Update(ctxt, clusterInfo, options.SetOptions{}); err != nil {
-		return fmt.Errorf("failed to re-enable cluster: %s", err)
+
+	// Implemented retry on conflict, because we get stuck if the upgrade-ipam
+	// container fails here and the datastore doesn't get ready again
+	for i := uint(0); i < 5; i++ {
+		clusterInfo, err := c.ClusterInformation().Get(ctxt, "default", options.GetOptions{})
+		if err != nil {
+			return fmt.Errorf("failed to fetch cluster information: %s", err)
+		}
+		t := true
+		clusterInfo.Spec.DatastoreReady = &t
+		if clusterInfo, err = c.ClusterInformation().Update(ctxt, clusterInfo, options.SetOptions{}); err != nil {
+			if _, ok := err.(errors.ErrorResourceUpdateConflict); ok {
+				log.Info("Encountered update conflict, retrying...")
+				time.Sleep(1 * time.Second)
+				continue
+			}
+			return fmt.Errorf("failed to re-enable cluster by updating cluster informations: %s", err)
+		}
+		break
 	}
+
 	log.Info("successfully set Calico datastore readiness to true!")
 
 	return nil
